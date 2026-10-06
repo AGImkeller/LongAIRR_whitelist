@@ -1,0 +1,226 @@
+# ============================================================================ #
+# LongAIRR_whitelist Snakemake workflow
+#
+# Purpose:
+#   Build a LongAIRR-compatible Visium HD 3' SPBC SQLite index from long-read
+#   spatial AIRR data.
+#
+# Workflow:
+#   1. longairrwhitelist preprocess
+#   2. spaceranger count --create-bam=true
+#   3. longairrwhitelist build-index
+#
+# Important:
+#   Percula and Space Ranger both create their own output directories.
+#   Therefore this workflow uses marker files outside those tool output
+#   directories instead of declaring files inside tool-created directories as
+#   Snakemake outputs.
+# ============================================================================ #
+
+from pathlib import Path
+import shlex
+
+configfile: "config.yaml"
+
+
+def shq(value):
+    return shlex.quote(str(value))
+
+
+def join_extra_args(args):
+    if args is None:
+        return ""
+    if isinstance(args, str):
+        return args
+    if isinstance(args, list):
+        return " ".join(shlex.quote(str(x)) for x in args)
+    raise ValueError("extra_args must be string, list, or null")
+
+
+def flag(enabled, text):
+    return text if bool(enabled) else ""
+
+
+def optional_int_arg(name, value):
+    if value is None:
+        return ""
+    return f"{name} {int(value)}"
+
+
+SAMPLE = str(config["sample"])
+PLATFORM = str(config.get("platform", "ont")).lower()
+
+if PLATFORM in ("nanopore", "ont"):
+    PLATFORM = "ont"
+else:
+    raise ValueError("This example workflow currently supports platform: ont")
+
+INPUT_READS = config["input"]["reads"]
+INPUT_TYPE = config["input"].get("input_type", "auto")
+
+OUT_BASE = Path(config["output"]["base_dir"]).expanduser()
+
+PREPROCESS_DIR = OUT_BASE / "preprocess" / SAMPLE
+PREPROCESS_PARENT = PREPROCESS_DIR.parent
+
+SPACERANGER_PARENT = Path(config["spaceranger"]["output_dir"]).expanduser()
+SPACERANGER_ID = config["spaceranger"].get("id", f"{SAMPLE}_spaceranger")
+SPACERANGER_OUT = SPACERANGER_PARENT / SPACERANGER_ID
+SPACERANGER_BAM = SPACERANGER_OUT / "outs" / "possorted_genome_bam.bam"
+
+INDEX_DIR = OUT_BASE / "index"
+INDEX_PREFIX = INDEX_DIR / f"{SAMPLE}.visiumhd.spbc"
+INDEX_SQLITE = Path(str(INDEX_PREFIX) + ".sqlite")
+INDEX_QC = Path(str(INDEX_PREFIX) + ".qc.tsv")
+INDEX_SUMMARY = Path(str(INDEX_PREFIX) + ".summary.json")
+
+LOG_DIR = OUT_BASE / "logs"
+CMD_DIR = OUT_BASE / "commands"
+MARKER_DIR = OUT_BASE / "markers"
+PREPROCESS_DONE = MARKER_DIR / f"{SAMPLE}.preprocess.done"
+SPACERANGER_DONE = MARKER_DIR / f"{SAMPLE}.spaceranger.done"
+
+PREPROCESS = config.get("preprocess", {})
+PREPROCESS_THREADS = PREPROCESS.get("threads", 4)
+PREPROCESS_FORCE_FLAG = flag(PREPROCESS.get("force", False), "--force")
+PREPROCESS_EXTRA_ARGS = join_extra_args(PREPROCESS.get("extra_args", ""))
+
+SR = config["spaceranger"]
+SR_SAMPLE_ARG = f"--sample={shq(SR['sample'])}" if SR.get("sample") else ""
+SR_LOCALCORES = SR.get("localcores", 8)
+SR_LOCALMEM = SR.get("localmem", 64)
+SR_EXTRA_ARGS = join_extra_args(SR.get("extra_args", ""))
+
+BI = config.get("build_index", {})
+BI_THREADS = BI.get("threads", 8)
+BI_ALLOWED_LENGTHS_LIST = BI.get("allowed_lengths", []) or []
+BI_ALLOWED_LENGTHS_ARG = ""
+if BI_ALLOWED_LENGTHS_LIST:
+    BI_ALLOWED_LENGTHS_ARG = "--allowed-lengths " + " ".join(str(x) for x in BI_ALLOWED_LENGTHS_LIST)
+BI_FILTER_LENGTHS_FLAG = flag(BI.get("filter_lengths", False), "--filter-lengths")
+BI_EXPORT_TSV_FLAG = flag(BI.get("export_tsv", False), "--export-tsv")
+BI_FORCE_FLAG = flag(BI.get("force", False), "--force")
+BI_MAX_READS = BI.get("max_reads", 0)
+BI_PROGRESS = BI.get("progress", 1000000)
+BI_CHUNK_UNIQUE = BI.get("chunk_unique", 1000000)
+BI_CB_TAG = shq(BI.get("cb_tag", config.get("cb_tag", "CB")))
+
+
+Q_SAMPLE = shq(SAMPLE)
+Q_INPUT_READS = shq(INPUT_READS)
+Q_PREPROCESS_DIR = shq(PREPROCESS_DIR)
+Q_PREPROCESS_PARENT = shq(PREPROCESS_PARENT)
+Q_SPACERANGER_PARENT = shq(SPACERANGER_PARENT)
+Q_SPACERANGER_BAM = shq(SPACERANGER_BAM)
+Q_TRANSCRIPTOME = shq(SR["transcriptome"])
+Q_SLIDE = shq(SR["slide"])
+Q_AREA = shq(SR["area"])
+Q_CYTAIMAGE = shq(SR["cytaimage"])
+Q_INDEX_SQLITE = shq(INDEX_SQLITE)
+Q_INDEX_PREFIX = shq(INDEX_PREFIX)
+
+
+rule all:
+    input:
+        sqlite=str(INDEX_SQLITE),
+        qc=str(INDEX_QC),
+        summary=str(INDEX_SUMMARY)
+
+
+rule preprocess:
+    input:
+        reads=INPUT_READS
+    output:
+        done=str(PREPROCESS_DONE)
+    log:
+        str(LOG_DIR / "preprocess.log")
+    shell:
+        """
+        mkdir -p {LOG_DIR} {CMD_DIR} {MARKER_DIR} {Q_PREPROCESS_PARENT}
+
+        cat > {CMD_DIR}/01_preprocess.sh <<'EOF'
+longairrwhitelist preprocess \
+  --platform {PLATFORM} \
+  --input {Q_INPUT_READS} \
+  --input-type {INPUT_TYPE} \
+  --out {Q_PREPROCESS_DIR} \
+  --sample {Q_SAMPLE} \
+  --threads {PREPROCESS_THREADS} \
+  {PREPROCESS_FORCE_FLAG} \
+  {PREPROCESS_EXTRA_ARGS}
+EOF
+
+        bash {CMD_DIR}/01_preprocess.sh > {log} 2>&1
+        test -f {Q_PREPROCESS_DIR}/manifest.json
+        touch {output.done}
+        """
+
+
+rule spaceranger_count:
+    input:
+        preprocess_done=str(PREPROCESS_DONE)
+    output:
+        done=str(SPACERANGER_DONE)
+    log:
+        str(LOG_DIR / "spaceranger.log")
+    shell:
+        """
+        mkdir -p {LOG_DIR} {CMD_DIR} {MARKER_DIR} {SPACERANGER_PARENT}
+
+        cat > {CMD_DIR}/02_spaceranger_count.sh <<'EOF'
+cd {Q_SPACERANGER_PARENT}
+
+spaceranger count \
+  --id={SPACERANGER_ID} \
+  --transcriptome={Q_TRANSCRIPTOME} \
+  --fastqs={Q_PREPROCESS_DIR} \
+  {SR_SAMPLE_ARG} \
+  --slide={Q_SLIDE} \
+  --area={Q_AREA} \
+  --cytaimage={Q_CYTAIMAGE} \
+  --localcores={SR_LOCALCORES} \
+  --localmem={SR_LOCALMEM} \
+  --create-bam=true \
+  {SR_EXTRA_ARGS}
+EOF
+
+        bash {CMD_DIR}/02_spaceranger_count.sh > {log} 2>&1
+        test -f {Q_SPACERANGER_BAM}
+        touch {output.done}
+        """
+
+
+rule build_index:
+    input:
+        spaceranger_done=str(SPACERANGER_DONE)
+    output:
+        sqlite=str(INDEX_SQLITE),
+        qc=str(INDEX_QC),
+        summary=str(INDEX_SUMMARY)
+    log:
+        str(LOG_DIR / "build_index.log")
+    shell:
+        """
+        mkdir -p {LOG_DIR} {CMD_DIR} {INDEX_DIR}
+
+        cat > {CMD_DIR}/03_build_index.sh <<'EOF'
+longairrwhitelist build-index \
+  --bam {Q_SPACERANGER_BAM} \
+  --out {Q_INDEX_SQLITE} \
+  --out-prefix {Q_INDEX_PREFIX} \
+  --threads {BI_THREADS} \
+  --max-reads {BI_MAX_READS} \
+  --progress {BI_PROGRESS} \
+  --chunk-unique {BI_CHUNK_UNIQUE} \
+  --cb-tag {BI_CB_TAG} \
+  {BI_ALLOWED_LENGTHS_ARG} \
+  {BI_FILTER_LENGTHS_FLAG} \
+  {BI_EXPORT_TSV_FLAG} \
+  {BI_FORCE_FLAG}
+EOF
+
+        bash {CMD_DIR}/03_build_index.sh > {log} 2>&1
+        test -f {output.sqlite}
+        test -f {output.qc}
+        test -f {output.summary}
+        """

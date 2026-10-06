@@ -1,0 +1,76 @@
+# ============================================================================ #
+# LongAIRR_whitelist example Snakemake config (ONT long-read AIRR)
+#
+# This workflow builds a LongAIRR-compatible Visium HD 3' SPBC SQLite index:
+#   1. longairrwhitelist preprocess
+#   2. spaceranger count --create-bam=true
+#   3. longairrwhitelist build-index
+#
+# Usage:
+#   snakemake -j 12 --configfile config.yaml
+# ============================================================================ #
+
+#--------------------------General / Input / Output-----------------------------
+
+sample: "sp21_sub"
+platform: "ont"       # current workflow support: ont
+
+# Input can be a BAM, FASTQ/FASTQ.GZ, or a directory containing FASTQ/BAM files.
+# For the intended global LongAIRR workflow this can be the output from:
+#   longairr basecall: dorado/simplex_duplex BAM
+#   longairr filter:   longairr_filtered.fastq
+input:
+  reads: "/path/to/longairr_filtered.fastq"
+  input_type: "auto"  # auto, bam, or fastq
+
+# Use local scratch / local disk for active Space Ranger and SQLite outputs.
+# Network/CIFS mounts can cause Space Ranger symlink issues or SQLite locking.
+output:
+  base_dir: "/path/to/local_or_cluster_scratch/longairr_whitelist_run"
+
+
+#---------------------longairrwhitelist preprocess------------------------------
+
+preprocess:
+  threads: 8
+  force: true
+  extra_args: ""       # Optional extra Percula arguments
+
+
+#------------------------------spaceranger count--------------------------------
+
+spaceranger:
+  id: "sample_airr_hd"
+  transcriptome: "/path/to/refdata-gex-GRCh38-2020-A"
+  sample: ""           # Optional --sample argument for Space Ranger
+
+  slide: "<visium_hd_slide_serial>"
+  area: "<capture_area>"
+  cytaimage: "/path/to/cytassist_image.tif"
+
+  # Space Ranger creates <output_dir>/<id>/ itself.
+  output_dir: "/path/to/local_or_cluster_scratch/longairr_whitelist_run/spaceranger"
+
+  localcores: 12
+  localmem: 64
+  extra_args: ""       # Optional extra Space Ranger arguments
+
+
+#-------------------------longairrwhitelist build-index-------------------------
+
+build_index:
+  threads: 12
+
+  # Optional: set e.g. [29, 30, 31] to add an allowed-length summary and/or use
+  # with filter_lengths: true. Empty list keeps all valid A/C/G/T raw CR lengths.
+  allowed_lengths: []
+  filter_lengths: false
+
+  export_tsv: false     # Optional gzipped TSV exports of SQLite tables
+  force: true
+
+  # Testing: max_reads > 0 scans only the first N BAM records.
+  # Full run: keep max_reads at 0.
+  max_reads: 0
+  progress: 1000000
+  chunk_unique: 1000000

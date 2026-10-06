@@ -1,0 +1,16 @@
+name: longairr_whitelist
+
+channels:
+  - conda-forge
+  - bioconda
+  - nanoporetech
+
+dependencies:
+  - python=3.10
+  - samtools
+  - pysam
+  - percula
+  - fastcat
+  - git
+  - pip
+  - snakemake-minimal

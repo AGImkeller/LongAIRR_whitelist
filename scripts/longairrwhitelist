@@ -1,0 +1,590 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+TOOL_CMD="$(basename "$0")"
+PYTHON_BIN="${LONGAIRRWHITELIST_PYTHON:-python}"
+
+source "${SCRIPT_DIR}/longairrwhitelist_utils.sh"
+source "${SCRIPT_DIR}/longairrwhitelist_version.sh"
+VERSION="${LONGAIRR_WHITELIST_VERSION}"
+export LONGAIRR_WHITELIST_VERSION
+
+#=============================================================
+#
+#        Script:  longairrwhitelist.sh
+#         Usage:  longairrwhitelist [COMMANDS] [OPTIONS]
+#
+#                 Available Modules:
+#                 longairrwhitelist check [OPTIONS]
+#                 longairrwhitelist preprocess [OPTIONS]
+#                 longairrwhitelist build-index [OPTIONS]
+#
+#         NOTES:  Install the LongAIRR-Whitelist software with the corresponding install.sh script.
+#
+#   DESCRIPTION: 
+#
+#        AUTHOR:  Jonas Schuck, jschuckdev@gmail.com
+#    BUG-REPORT:  
+#
+#=============================================================
+
+# Check if necessary tools are installed
+#---------------------longairrwhitelist check ----------------------------------
+
+show_help_check() {
+    cat <<HELP
+Usage:
+  ${TOOL_CMD} check
+
+Checks the tools needed by LongAIRR_whitelist:
+  python, sqlite3 Python module, samtools, fastcat, percula, spaceranger
+HELP
+}
+
+check() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)
+                show_help_check
+                exit 0
+                ;;
+            *)
+                echo "[ERROR] Unknown check argument: $1" >&2
+                show_help_check >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    echo "LongAIRR_whitelist ${VERSION}"
+    echo "[INFO] Checking environment"
+
+    if command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+        echo "[OK] python: $(${PYTHON_BIN} --version 2>&1) ($(command -v "${PYTHON_BIN}"))"
+    else
+        echo "[FAIL] python executable not found: ${PYTHON_BIN}" >&2
+        exit 1
+    fi
+
+    "${PYTHON_BIN}" - <<'PY'
+import sqlite3
+print(f"[OK] sqlite3 Python module: {sqlite3.sqlite_version}")
+PY
+
+    if command -v samtools >/dev/null 2>&1; then
+        echo "[OK] samtools: $(command -v samtools) ($(print_tool_version samtools))"
+    else
+        echo "[FAIL] samtools not found on PATH. build-index requires samtools." >&2
+        exit 1
+    fi
+
+    if command -v fastcat >/dev/null 2>&1; then
+        echo "[OK] fastcat: $(command -v fastcat) ($(print_tool_version fastcat))"
+    else
+        echo "[WARN] fastcat not found on PATH. FASTQ preprocessing requires fastcat."
+    fi
+
+    if command -v percula >/dev/null 2>&1; then
+        echo "[OK] percula: $(command -v percula) ($(print_tool_version percula))"
+    else
+        echo "[WARN] percula not found on PATH. ONT preprocessing requires percula."
+    fi
+
+    if command -v spaceranger >/dev/null 2>&1; then
+        echo "[OK] spaceranger: $(command -v spaceranger) ($(print_tool_version spaceranger))"
+    else
+        echo "[WARN] spaceranger not found on PATH. Space Ranger must be installed manually."
+    fi
+}
+
+# Preprocess long-reads prior to SpaceRanger usage // split into artificial short-reads
+#--------------------------- longairrwhitelist preprocess ----------------------
+show_help_preprocess() {
+    cat <<HELP
+Usage:
+  ${TOOL_CMD} preprocess --platform ont --input <bam_fastq_or_dir> --out <outdir> [options] [-- <extra percula args>]
+
+Required:
+  --platform ont              Preprocessing backend. Currently ONT/Percula is supported.
+  --input, -i PATH            Input BAM, FASTQ/FASTQ.GZ, or directory
+  --out, -o DIR               Percula output directory
+
+Options:
+  --input-type auto|bam|fastq Input type [default: auto]
+  --sample NAME               Sample name for manifest/template [default: basename of --out]
+  --threads INT               fastcat threads for FASTQ input [default: 4]
+  --force                     Overwrite LongAIRR_whitelist manifest/template and fastcat histograms
+  --dry-run                   Print commands without running preprocessing
+  -h, --help                  Show this help message
+
+Examples:
+  ${TOOL_CMD} preprocess --platform ont --input reads.bam --out percula_out
+
+  ${TOOL_CMD} preprocess --platform ont --input filtered.fastq --out percula_out --threads 8
+
+  ${TOOL_CMD} preprocess --platform ont --input filtered_fastqs/ --input-type fastq --out percula_out
+
+  ${TOOL_CMD} preprocess --platform ont --input reads.bam --out percula_out
+HELP
+}
+
+preprocess() {
+
+    # parameters
+    local platform=""
+    local input=""
+    local input_type="auto" # "bam" / "fastq" / "auto"
+    local out=""
+    local sample=""
+    local threads="4"
+    local dry_run="false"
+    local force="false"
+    local extra_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --platform)
+                platform="$2"; shift 2 ;;
+            --ont)
+                platform="ont"; shift ;;
+            --input|-i)
+                input="$2"; shift 2 ;;
+            --input-type)
+                input_type="$2"; shift 2 ;;
+            --out|-o)
+                out="$2"; shift 2 ;;
+            --sample)
+                sample="$2"; shift 2 ;;
+            --threads)
+                threads="$2"; shift 2 ;;
+            --force)
+                force="true"; shift ;;
+            --dry-run)
+                dry_run="true"; shift ;;
+            --help|-h)
+                show_help_preprocess; exit 0 ;;
+            --)
+                shift
+                extra_args+=("$@")
+                break ;;
+            *)
+                echo "[ERROR] Unknown preprocess argument: $1" >&2
+                show_help_preprocess >&2
+                exit 1 ;;
+        esac
+    done
+
+    if [[ -z "${platform}" || -z "${input}" || -z "${out}" ]]; then
+        echo "[ERROR] preprocess requires --platform, --input, and --out" >&2
+        show_help_preprocess >&2
+        exit 1
+    fi
+
+    case "${platform}" in
+        ont|nanopore) platform="ont" ;;
+        *)
+            echo "[ERROR] Unsupported preprocess platform: ${platform}. Currently use: --platform ont" >&2
+            exit 1 ;;
+    esac
+
+    if [[ ! -e "${input}" ]]; then
+        echo "[ERROR] Input not found: ${input}" >&2
+        exit 1
+    fi
+
+    case "${input_type}" in
+        auto|bam|fastq) ;;
+        *)
+            echo "[ERROR] Invalid --input-type: ${input_type}. Use auto, bam, or fastq." >&2
+            exit 1 ;;
+    esac
+
+    if ! [[ "${threads}" =~ ^[0-9]+$ ]] || [[ "${threads}" -lt 1 ]]; then
+        echo "[ERROR] --threads must be a positive integer." >&2
+        exit 1
+    fi
+
+    if [[ -z "${sample}" ]]; then
+        sample="$(basename "${out}")"
+    fi
+
+    input_type="$(detect_input_type "${input}" "${input_type}")"
+    echo "[INFO] Input type: ${input_type}"
+
+    local log_path="${out%/}.preprocess.log"
+    local template_path="${out}/spaceranger_template.sh"
+    local cmd_string=""
+
+    if [[ "${input_type}" == "bam" ]]; then
+        local cmd=(percula preprocess "${out}" "${input}" "${extra_args[@]}")
+        cmd_string="$(printf '%q ' "${cmd[@]}")"
+
+        echo "[INFO] ONT BAM preprocessing command:"
+        print_array_command "${cmd[@]}"
+
+        if [[ "${dry_run}" == "true" ]]; then
+            echo "[INFO] Dry-run only. Command was not executed."
+            return 0
+        fi
+
+        if ! command -v percula >/dev/null 2>&1; then
+            echo "[ERROR] percula not found on PATH." >&2
+            exit 1
+        fi
+
+        if [[ -e "${out}/manifest.json" && "${force}" != "true" ]]; then
+            echo "[ERROR] Existing manifest found: ${out}/manifest.json ; use --force to overwrite." >&2
+            exit 1
+        fi
+
+        mkdir -p "$(dirname "${out}")"
+        echo "[INFO] Writing preprocess log: ${log_path}"
+        "${cmd[@]}" > >(tee "${log_path}") 2> >(tee -a "${log_path}" >&2)
+
+    elif [[ "${input_type}" == "fastq" ]]; then
+        local fastcat_hist_dir="${out%/}.fastcat_histograms"
+        local fastcat_cmd=(fastcat --bam_out --threads "${threads}" --histograms "${fastcat_hist_dir}")
+        if [[ -d "${input}" ]]; then
+            fastcat_cmd+=(--recurse)
+        fi
+        fastcat_cmd+=("${input}")
+
+        local percula_cmd=(percula preprocess "${out}" - "${extra_args[@]}")
+        cmd_string="$(printf '%q ' "${fastcat_cmd[@]}") | $(printf '%q ' "${percula_cmd[@]}")"
+
+        echo "[INFO] ONT FASTQ preprocessing command:"
+        print_array_command "${fastcat_cmd[@]}"
+        echo "  |"
+        print_array_command "${percula_cmd[@]}"
+        echo "[INFO] fastcat histogram directory: ${fastcat_hist_dir}"
+
+        if [[ "${dry_run}" == "true" ]]; then
+            echo "[INFO] Dry-run only. Commands were not executed."
+            return 0
+        fi
+
+        if ! command -v fastcat >/dev/null 2>&1; then
+            echo "[ERROR] fastcat not found on PATH." >&2
+            exit 1
+        fi
+        if ! command -v percula >/dev/null 2>&1; then
+            echo "[ERROR] percula not found on PATH." >&2
+            exit 1
+        fi
+
+        if [[ -e "${out}/manifest.json" && "${force}" != "true" ]]; then
+            echo "[ERROR] Existing manifest found: ${out}/manifest.json ; use --force to overwrite." >&2
+            exit 1
+        fi
+        if [[ -e "${fastcat_hist_dir}" ]]; then
+            if [[ "${force}" == "true" ]]; then
+                rm -rf "${fastcat_hist_dir}"
+            else
+                echo "[ERROR] Existing fastcat histogram directory: ${fastcat_hist_dir} ; use --force to overwrite." >&2
+                exit 1
+            fi
+        fi
+
+        mkdir -p "$(dirname "${out}")" "$(dirname "${fastcat_hist_dir}")"
+        echo "[INFO] Writing preprocess log: ${log_path}"
+        {
+            echo "[CMD] ${cmd_string}"
+            "${fastcat_cmd[@]}" | "${percula_cmd[@]}"
+        } > >(tee "${log_path}") 2> >(tee -a "${log_path}" >&2)
+    fi
+
+    mkdir -p "${out}"
+    write_spaceranger_template "${template_path}" "${sample}" "${out}"
+    write_manifest "${out}/manifest.json" "${platform}" "${input}" "${input_type}" "${out}" "${sample}" "${cmd_string}" "${template_path}"
+
+    echo "[INFO] Wrote manifest: ${out}/manifest.json"
+    echo "[INFO] Wrote editable Space Ranger template: ${template_path}"
+}
+
+
+# Build index with observed spbc-sequences
+#----------------------------longairrwhitelist build-index ---------------------
+
+show_help_build_index() {
+    cat <<HELP
+Usage:
+  ${TOOL_CMD} build-index --bam <possorted_genome_bam.bam> --out <index.sqlite> [options]
+
+Builds a sample-specific Visium HD 3' SQLite index from Space Ranger CR/CB tags.
+The runtime table maps observed raw SPBC sequences to corrected 10x SPBC IDs.
+Ambiguous raw SPBCs are excluded from the runtime lookup and stored separately.
+
+Required:
+  --bam PATH                  Space Ranger outs/possorted_genome_bam.bam
+  --out, --sqlite PATH        Output SQLite index
+
+Options:
+  --out-prefix PATH           Prefix for summary/QC outputs [default: output path without suffix]
+  --samtools PATH             samtools executable [default: samtools]
+  --threads INT               samtools threads [default: 8]
+  --max-reads INT             Process first N reads only; 0 means all [default: 0]
+  --progress INT              Progress interval in reads; 0 disables [default: 1000000]
+  --chunk-unique INT          Flush after this many unique raw_spbc/spbc_id pairs [default: 1000000]
+  --cr-tag TAG                Raw barcode tag [default: CR]
+  --cb-tag TAG                Corrected barcode tag [default: CB]
+  --allowed-lengths INT ...   Raw CR lengths used with --filter-lengths
+  --filter-lengths            Exclude raw CR lengths outside --allowed-lengths
+  --export-tsv                Export SQLite tables as gzipped TSV files
+  --force                     Overwrite existing SQLite output
+  --dry-run                   Print command without running it
+  -h, --help                  Show this help message
+
+Example:
+  ${TOOL_CMD} build-index \\
+    --bam spaceranger_out/outs/possorted_genome_bam.bam \\
+    --out sample.visiumhd.spbc.sqlite \\
+    --threads 12 \\
+    --force
+HELP
+}
+
+build_index() {
+
+    # parameters
+    local bam=""
+    local sqlite=""
+    local out_prefix=""
+    local samtools="samtools"
+    local threads="8"
+    local max_reads="0" # for testing, only process a subset of reads
+    local progress="1000000"
+    local chunk_unique="1000000"
+    local cr_tag="CR"
+    local cb_tag="CB"   # tag containing the sequence
+    local force="false" # force rewriting
+    local dry_run="false"
+    local filter_lengths="false"
+    local export_tsv="false"
+    local allowed_lengths=()
+
+    local build_script="${SCRIPT_DIR}/build_spbc_index.py"
+    local python_bin="${PYTHON_BIN:-python}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --bam)
+                bam="$2"; shift 2 ;;
+            --out|--sqlite)
+                sqlite="$2"; shift 2 ;;
+            --out-prefix)
+                out_prefix="$2"; shift 2 ;;
+            --samtools)
+                samtools="$2"; shift 2 ;;
+            --threads)
+                threads="$2"; shift 2 ;;
+            --max-reads)
+                max_reads="$2"; shift 2 ;;
+            --progress)
+                progress="$2"; shift 2 ;;
+            --chunk-unique)
+                chunk_unique="$2"; shift 2 ;;
+            --cr-tag)
+                cr_tag="$2"; shift 2 ;;
+            --cb-tag)
+                cb_tag="$2"; shift 2 ;;
+            --allowed-lengths)
+                shift
+                allowed_lengths=()
+                while [[ $# -gt 0 && "$1" != --* ]]; do
+                    allowed_lengths+=("$1")
+                    shift
+                done ;;
+            --filter-lengths)
+                filter_lengths="true"; shift ;;
+            --export-tsv)
+                export_tsv="true"; shift ;;
+            --force)
+                force="true"; shift ;;
+            --dry-run)
+                dry_run="true"; shift ;;
+            --help|-h)
+                show_help_build_index; exit 0 ;;
+            *)
+                echo "[ERROR] Unknown build-index argument: $1" >&2
+                show_help_build_index >&2
+                exit 1 ;;
+        esac
+    done
+
+    if [[ -z "${bam}" ]]; then
+        echo "[ERROR] Missing required argument: --bam" >&2
+        exit 1
+    fi
+    if [[ -z "${sqlite}" ]]; then
+        echo "[ERROR] Missing required argument: --out / --sqlite" >&2
+        exit 1
+    fi
+
+    bam="$(realpath -m "${bam}")"
+    sqlite="$(realpath -m "${sqlite}")"
+
+    if [[ ! -f "${bam}" ]]; then
+        echo "[ERROR] BAM file does not exist: ${bam}" >&2
+        exit 1
+    fi
+    if [[ ! -f "${build_script}" ]]; then
+        echo "[ERROR] Internal build-index script not found: ${build_script}" >&2
+        exit 1
+    fi
+
+    if [[ -z "${out_prefix}" ]]; then
+        case "${sqlite}" in
+            *.sqlite) out_prefix="${sqlite%.sqlite}" ;;
+            *.sqlite3) out_prefix="${sqlite%.sqlite3}" ;;
+            *.db) out_prefix="${sqlite%.db}" ;;
+            *) out_prefix="${sqlite}" ;;
+        esac
+    fi
+    out_prefix="$(realpath -m "${out_prefix}")"
+
+    mkdir -p "$(dirname "${sqlite}")" "$(dirname "${out_prefix}")"
+
+    if [[ -e "${sqlite}" && "${force}" == "false" ]]; then
+        echo "[ERROR] Output SQLite already exists: ${sqlite}" >&2
+        echo "        Use --force to overwrite." >&2
+        exit 1
+    fi
+
+    if [[ "${filter_lengths}" == "true" && "${#allowed_lengths[@]}" -eq 0 ]]; then
+        echo "[ERROR] --filter-lengths requires --allowed-lengths" >&2
+        exit 1
+    fi
+
+    for value in "${threads}" "${max_reads}" "${progress}" "${chunk_unique}"; do
+        if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
+            echo "[ERROR] Numeric options must be non-negative integers." >&2
+            exit 1
+        fi
+    done
+    if [[ "${threads}" -lt 1 || "${chunk_unique}" -lt 1 ]]; then
+        echo "[ERROR] --threads and --chunk-unique must be >= 1." >&2
+        exit 1
+    fi
+
+    for len in "${allowed_lengths[@]}"; do
+        if ! [[ "${len}" =~ ^[0-9]+$ ]] || [[ "${len}" -lt 1 ]]; then
+            echo "[ERROR] --allowed-lengths must contain positive integers only." >&2
+            exit 1
+        fi
+    done
+
+    local cmd=(
+        "${python_bin}" "${build_script}"
+        --bam "${bam}"
+        --out "${sqlite}"
+        --out-prefix "${out_prefix}"
+        --samtools "${samtools}"
+        --threads "${threads}"
+        --max-reads "${max_reads}"
+        --progress "${progress}"
+        --chunk-unique "${chunk_unique}"
+        --cr-tag "${cr_tag}"
+        --cb-tag "${cb_tag}"
+    )
+
+    if [[ "${#allowed_lengths[@]}" -gt 0 ]]; then
+        cmd+=(--allowed-lengths "${allowed_lengths[@]}")
+    fi
+    if [[ "${filter_lengths}" == "true" ]]; then
+        cmd+=(--filter-lengths)
+    fi
+    if [[ "${export_tsv}" == "true" ]]; then
+        cmd+=(--export-tsv)
+    fi
+    if [[ "${force}" == "true" ]]; then
+        cmd+=(--force)
+    fi
+
+    echo "[INFO] Build-index module"
+    echo "[INFO] Input BAM:     ${bam}"
+    echo "[INFO] SQLite output: ${sqlite}"
+    echo "[INFO] Output prefix: ${out_prefix}"
+    echo "[INFO] Threads:       ${threads}"
+    echo "[INFO] Max reads:     ${max_reads}"
+    if [[ "${#allowed_lengths[@]}" -gt 0 ]]; then
+        echo "[INFO] Length filter: ${filter_lengths} (${allowed_lengths[*]})"
+    else
+        echo "[INFO] Length filter: false"
+    fi
+    echo "[INFO] Export TSV:    ${export_tsv}"
+    echo
+    echo "[CMD]"
+    print_array_command "${cmd[@]}"
+
+    if [[ "${dry_run}" == "true" ]]; then
+        echo "[INFO] Dry-run only. Command was not executed."
+        exit 0
+    fi
+
+    "${cmd[@]}"
+
+    echo
+    echo "[INFO] Build-index finished."
+    echo "[INFO] SQLite index: ${sqlite}"
+    echo "[INFO] Summary JSON: ${out_prefix}.summary.json"
+    echo "[INFO] QC TSV:       ${out_prefix}.qc.tsv"
+}
+
+#----------------------longairrwhitelist main ----------------------------------
+
+show_help() {
+    cat <<HELP
+LongAIRR_whitelist ${VERSION}
+Companion toolkit for Visium HD 3' long-read AIRR SPBC indexing.
+
+Usage:
+  ${TOOL_CMD} <command> [options]
+
+Commands:
+  check          Check if software dependencies are available
+  preprocess     Prepare ONT long-read AIRR data for SpaceRanger
+  build-index    Build a LongAIRR-ready Visium HD 3' SPBC SQLite index from SpaceRanger output
+  help           Show this help message
+
+Examples:
+  ${TOOL_CMD} preprocess --platform ont --input filtered.fastq --out sample_percula_out
+
+  ${TOOL_CMD} build-index \\
+    --bam spaceranger_out/outs/possorted_genome_bam.bam \\
+    --out sample.visiumhd.spbc.sqlite
+
+Use '${TOOL_CMD} <command> --help' for command-specific help.
+HELP
+}
+
+if [[ $# -lt 1 ]]; then
+    show_help
+    exit 0
+fi
+
+case "$1" in
+    --version|version)
+        echo "LongAIRR_whitelist ${VERSION}"
+        exit 0 ;;
+    help|--help|-h)
+        show_help
+        exit 0 ;;
+esac
+
+cmd="$1"
+shift
+
+case "${cmd}" in
+    check)
+        check "$@" ;;
+    preprocess)
+        preprocess "$@" ;;
+    build-index)
+        build_index "$@" ;;
+    *)
+        echo "[ERROR] Unknown command: ${cmd}" >&2
+        show_help >&2
+        exit 1 ;;
+esac

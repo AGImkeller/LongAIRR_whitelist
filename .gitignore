@@ -1,0 +1,7 @@
+.snakemake/
+.venv-docs/
+site/
+config_imkeller.yaml
+config_imkeller2.yaml
+config_old.yaml
+Snakefile_old
